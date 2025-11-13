@@ -14,6 +14,8 @@
     "@google/generative-ai": "^0.24.1",
     "dotenv": "^17.2.2",
     "node-telegram-bot-api": "^0.66.0",
+        "express": "^5.1.0",
+    "fs": "^0.0.1-security",
     "socks-proxy-agent": "^8.0.5"
   }
 }
