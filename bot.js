@@ -17,7 +17,7 @@ if (!telegramToken || !geminiApiKey) {
 const bot = new TelegramBot(telegramToken, { polling: true });
 const genAI = new GoogleGenerativeAI(geminiApiKey);
 // استفاده از مدل سبک‌تر با محدودیت بیشتر (15 req/min به جای 2 req/min)
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
 let thesisKnowledge = "";
 try {
