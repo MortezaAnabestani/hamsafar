@@ -16,7 +16,6 @@ if (!telegramToken || !geminiApiKey) {
 
 const bot = new TelegramBot(telegramToken, { polling: true });
 const genAI = new GoogleGenerativeAI(geminiApiKey);
-// استفاده از مدل سبک‌تر با محدودیت بیشتر (15 req/min به جای 2 req/min)
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
 
 let thesisKnowledge = "";
@@ -32,65 +31,115 @@ try {
 const conversationHistory = {};
 const HISTORY_LIMIT = 20;
 
-// سیستم صف برای مدیریت Rate Limiting
-const requestQueue = [];
-let isProcessing = false;
-const REQUEST_DELAY = 5000; // 5 ثانیه بین درخواست‌ها (ایمن برای 15 req/min)
-const MAX_QUEUE_SIZE = 50;
-
-async function processQueue() {
-  if (isProcessing || requestQueue.length === 0) return;
-  
-  isProcessing = true;
-  const { chatId, prompt, msgId, type } = requestQueue.shift();
-  
-  try {
-    console.log(`[Queue] در حال پردازش درخواست ${type} برای Chat ID: ${chatId}`);
-    const result = await model.generateContent(prompt);
-    const responseText = result.response.text();
-    
-    if (type === 'message') {
-      bot.sendMessage(chatId, responseText, { reply_to_message_id: msgId });
-      
-      // ذخیره پاسخ در تاریخچه
-      if (conversationHistory[chatId]) {
-        conversationHistory[chatId].push(`همسفر: ${responseText}`);
-        if (conversationHistory[chatId].length > HISTORY_LIMIT) {
-          conversationHistory[chatId].shift();
-        }
-      }
-    } else if (type === 'summary') {
-      bot.sendMessage(chatId, responseText);
-    }
-    
-    console.log(`[Queue] پاسخ ${type} با موفقیت ارسال شد.`);
-    
-  } catch (error) {
-    console.error(`[Queue] خطا در پردازش ${type}:`, error);
-    
-    if (error.status === 429) {
-      // اگر باز هم Rate Limit خورد، درخواست را به ابتدای صف برگردان
-      console.log('[Queue] Rate Limit! درخواست به صف برگشت.');
-      requestQueue.unshift({ chatId, prompt, msgId, type });
-      bot.sendMessage(chatId, "⏳ بات در حال حاضر بسیار شلوغ است. درخواست شما در صف است، لطفاً صبور باشید...");
-    } else {
-      bot.sendMessage(chatId, "متاسفانه مشکلی در پردازش درخواست شما پیش آمد. لطفاً دوباره تلاش کنید.");
-    }
+// ================== سیستم Token Bucket برای Rate Limiting ==================
+class TokenBucket {
+  constructor(capacity, refillRate) {
+    this.capacity = capacity; // ظرفیت کل
+    this.tokens = capacity; // توکن‌های فعلی
+    this.refillRate = refillRate; // تعداد توکن در هر ثانیه
+    this.lastRefill = Date.now();
   }
-  
-  // تاخیر بین درخواست‌ها
-  setTimeout(() => {
-    isProcessing = false;
-    processQueue();
-  }, REQUEST_DELAY);
+
+  refill() {
+    const now = Date.now();
+    const timePassed = (now - this.lastRefill) / 1000; // به ثانیه
+    const tokensToAdd = timePassed * this.refillRate;
+    
+    this.tokens = Math.min(this.capacity, this.tokens + tokensToAdd);
+    this.lastRefill = now;
+  }
+
+  async consume(tokens = 1) {
+    this.refill();
+    
+    if (this.tokens >= tokens) {
+      this.tokens -= tokens;
+      return true;
+    }
+    
+    // محاسبه زمان انتظار
+    const tokensNeeded = tokens - this.tokens;
+    const waitTime = (tokensNeeded / this.refillRate) * 1000;
+    
+    console.log(`[Token Bucket] در انتظار ${Math.ceil(waitTime / 1000)} ثانیه...`);
+    await new Promise(resolve => setTimeout(resolve, waitTime));
+    
+    this.refill();
+    this.tokens -= tokens;
+    return true;
+  }
+
+  getStatus() {
+    this.refill();
+    return {
+      available: Math.floor(this.tokens),
+      capacity: this.capacity
+    };
+  }
 }
 
-// شروع پردازش صف
-setInterval(() => {
-  if (!isProcessing) {
-    processQueue();
+// ایجاد Token Bucket با محدودیت 15 درخواست در دقیقه
+// به صورت محافظه‌کارانه: 10 توکن با refill 0.15 توکن در ثانیه (9 در دقیقه)
+const rateLimiter = new TokenBucket(10, 0.15);
+
+// ================== تابع Retry با Exponential Backoff ==================
+async function callGeminiWithRetry(prompt, maxRetries = 5) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // منتظر دریافت توکن می‌مانیم
+      await rateLimiter.consume(1);
+      
+      console.log(`[Gemini] تلاش ${attempt}/${maxRetries} - توکن‌های باقیمانده: ${rateLimiter.getStatus().available}`);
+      
+      const result = await model.generateContent(prompt);
+      const responseText = result.response.text();
+      
+      console.log(`[Gemini] پاسخ با موفقیت دریافت شد.`);
+      return { success: true, text: responseText };
+      
+    } catch (error) {
+      console.error(`[Gemini] خطا در تلاش ${attempt}:`, error.message);
+      
+      if (error.status === 429) {
+        // استخراج زمان انتظار از پاسخ API
+        let retryAfter = 60; // پیش‌فرض: 60 ثانیه
+        
+        if (error.errorDetails) {
+          const retryInfo = error.errorDetails.find(d => d['@type']?.includes('RetryInfo'));
+          if (retryInfo && retryInfo.retryDelay) {
+            const delayMatch = retryInfo.retryDelay.match(/(\d+)/);
+            if (delayMatch) {
+              retryAfter = parseInt(delayMatch[1]);
+            }
+          }
+        }
+        
+        const backoffTime = retryAfter * 1000 * Math.pow(2, attempt - 1); // Exponential backoff
+        const waitTime = Math.min(backoffTime, 300000); // حداکثر 5 دقیقه
+        
+        console.log(`[Gemini] Rate Limit! انتظار ${Math.ceil(waitTime / 1000)} ثانیه...`);
+        
+        if (attempt < maxRetries) {
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+        } else {
+          return { 
+            success: false, 
+            error: 'Rate limit exceeded after multiple retries',
+            retryAfter: Math.ceil(waitTime / 1000)
+          };
+        }
+      } else {
+        // خطاهای غیر از Rate Limit
+        return { 
+          success: false, 
+          error: error.message || 'Unknown error'
+        };
+      }
+    }
   }
-}, 1000);
+  
+  return { success: false, error: 'Max retries exceeded' };
+}
 
 console.log("بات دستیار آنلاین شد...");
 
@@ -103,6 +152,9 @@ bot.onText(/\/start/, (msg) => {
 🔹 برای گفتگو، کافیست منشن کنید: @${bot.options.username}
 🔹 برای جستجو در دانش: /بگرد کلمه یا /search keyword
 🔹 برای دریافت خلاصه روایی گفتگو: /خلاصه یا /summary
+🔹 برای بررسی وضعیت بات: /status
+
+⚠️ توجه: به دلیل محدودیت API، ممکن است پاسخ‌ها کمی زمان‌بر باشند.
 
 بیایید با هم داستانی زیبا بسازیم! ✨`;
   
@@ -122,14 +174,8 @@ bot.onText(/\/خلاصه|\/summary/, async (msg) => {
     return;
   }
 
-  // بررسی اندازه صف
-  if (requestQueue.length >= MAX_QUEUE_SIZE) {
-    bot.sendMessage(chatId, "⚠️ صف درخواست‌ها پر است. لطفاً چند دقیقه دیگر تلاش کنید.");
-    return;
-  }
-
   bot.sendChatAction(chatId, "typing");
-  bot.sendMessage(chatId, "⏳ در حال آماده‌سازی خلاصه روایی گفتگوی شما...");
+  const statusMsg = await bot.sendMessage(chatId, "⏳ در حال آماده‌سازی خلاصه روایی... این ممکن است چند لحظه طول بکشد.");
 
   const summaryPrompt = `
 نقش شما: شما «همسفر» هستید؛ یک شریک نویسندگی خلاق که در حال بافتن قطعات پراکنده یک گفتگو به یک داستان واحد است.
@@ -149,14 +195,19 @@ ${history}
 حالا این گفتگو را به یک روایت واحد و زیبا تبدیل کن:
 `;
 
-  requestQueue.push({
-    chatId,
-    prompt: summaryPrompt,
-    msgId: msg.message_id,
-    type: 'summary'
-  });
+  const result = await callGeminiWithRetry(summaryPrompt);
   
-  console.log(`[Queue] درخواست خلاصه به صف اضافه شد. تعداد در صف: ${requestQueue.length}`);
+  await bot.deleteMessage(chatId, statusMsg.message_id);
+  
+  if (result.success) {
+    bot.sendMessage(chatId, result.text);
+  } else {
+    if (result.retryAfter) {
+      bot.sendMessage(chatId, `⚠️ بات در حال حاضر بسیار شلوغ است. لطفاً ${result.retryAfter} ثانیه دیگر دوباره تلاش کنید.`);
+    } else {
+      bot.sendMessage(chatId, `❌ متاسفانه در خلاصه کردن مکالمات مشکلی پیش آمد: ${result.error}`);
+    }
+  }
 });
 
 bot.onText(/\/بگرد (.+)|\/search (.+)/, (msg, match) => {
@@ -206,13 +257,16 @@ bot.onText(/\/بگرد (.+)|\/search (.+)/, (msg, match) => {
 
 bot.onText(/\/status/, (msg) => {
   const chatId = msg.chat.id;
+  const bucketStatus = rateLimiter.getStatus();
+  
   const queueStatus = `📊 وضعیت بات:
   
-🔸 درخواست‌های در صف: ${requestQueue.length}
-🔸 در حال پردازش: ${isProcessing ? 'بله' : 'خیر'}
-🔸 مدل: Gemini 1.5 Flash
-🔸 محدودیت: 15 درخواست در دقیقه
-🔸 تاخیر بین درخواست‌ها: ${REQUEST_DELAY / 1000} ثانیه`;
+🔸 توکن‌های موجود: ${bucketStatus.available}/${bucketStatus.capacity}
+🔸 مدل: gemini-2.5-pro
+🔸 محدودیت: ~9 درخواست در دقیقه (محافظه‌کارانه)
+🔸 Retry: فعال با Exponential Backoff
+
+✅ بات آماده دریافت درخواست است.`;
   
   bot.sendMessage(chatId, queueStatus);
 });
@@ -242,19 +296,12 @@ bot.on("message", async (msg) => {
         conversationHistory[chatId].shift();
       }
 
-      // بررسی اندازه صف
-      if (requestQueue.length >= MAX_QUEUE_SIZE) {
-        bot.sendMessage(chatId, "⚠️ بات در حال حاضر بسیار شلوغ است. صف درخواست‌ها پر است.\n\nلطفاً چند دقیقه دیگر تلاش کنید یا از دستور /status برای بررسی وضعیت استفاده کنید.");
-        return;
-      }
-
       console.log(`[Chat ID: ${chatId}] درخواست جدید دریافت شد: "${userQuery}"`);
       bot.sendChatAction(chatId, "typing");
       
-      const queuePosition = requestQueue.length + 1;
-      bot.sendMessage(
+      const statusMsg = await bot.sendMessage(
         chatId, 
-        `⏳ درخواست شما دریافت شد و در صف قرار گرفت (موقعیت: ${queuePosition})\n\nلطفاً صبور باشید...`,
+        `⏳ در حال پردازش درخواست شما...\n\nتوکن‌های موجود: ${rateLimiter.getStatus().available}`,
         { reply_to_message_id: msg.message_id }
       );
 
@@ -269,7 +316,7 @@ bot.on("message", async (msg) => {
 `;
       }
 
-      const chatHistory = conversationHistory[chatId].slice(-10).join("\n"); // فقط 10 پیام آخر برای کاهش Token
+      const chatHistory = conversationHistory[chatId].slice(-10).join("\n");
 
       const creativeAugmentationPrompt = `
 نقش شما:
@@ -301,14 +348,27 @@ ${chatHistory}
 "${userQuery}"
 `;
 
-      requestQueue.push({
-        chatId,
-        prompt: creativeAugmentationPrompt,
-        msgId: msg.message_id,
-        type: 'message'
-      });
+      const result = await callGeminiWithRetry(creativeAugmentationPrompt);
       
-      console.log(`[Queue] درخواست پیام به صف اضافه شد. تعداد در صف: ${requestQueue.length}`);
+      await bot.deleteMessage(chatId, statusMsg.message_id);
+      
+      if (result.success) {
+        bot.sendMessage(chatId, result.text, { reply_to_message_id: msg.message_id });
+        
+        // ذخیره پاسخ در تاریخچه
+        conversationHistory[chatId].push(`همسفر: ${result.text}`);
+        if (conversationHistory[chatId].length > HISTORY_LIMIT) {
+          conversationHistory[chatId].shift();
+        }
+        
+        console.log(`[Chat ID: ${chatId}] پاسخ تخصصی ارسال شد.`);
+      } else {
+        if (result.retryAfter) {
+          bot.sendMessage(chatId, `⚠️ بات در حال حاضر بسیار شلوغ است. لطفاً ${result.retryAfter} ثانیه دیگر دوباره تلاش کنید.`);
+        } else {
+          bot.sendMessage(chatId, `❌ متاسفانه در پردازش درخواست شما مشکلی پیش آمد: ${result.error}`);
+        }
+      }
     }
   } catch (error) {
     console.error("خطا در پردازش پیام:", error);
@@ -325,13 +385,13 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
+  const bucketStatus = rateLimiter.getStatus();
   res.json({
     status: "ok",
-    queue_size: requestQueue.length,
-    is_processing: isProcessing,
-    model: "gemini-1.5-flash",
-    rate_limit: "15 requests/minute",
-    delay_between_requests: `${REQUEST_DELAY / 1000}s`
+    tokens_available: bucketStatus.available,
+    tokens_capacity: bucketStatus.capacity,
+    model: "gemini-2.5-pro",
+    rate_limit: "~9 requests/minute (conservative)"
   });
 });
 
